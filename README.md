@@ -1,6 +1,6 @@
 # vulkan-tutorial-test
-This project was created to test an issue I experienced with creating a command buffer for bit blitting.
-The code found in master is copied from https://github.com/matthew-russo/vulkan-tutorial-rs/blob/29_multisampling/src/bin/28_generating_mipmaps.rs and functions correctly on my system, and uses Vulkano 0.11.1. The branch`version_0-19-0`uses the latet versions of all dependencies, including Vulkano 0.19.0, and panics on a BlitImageError. The same behavior also occurs on version 0.18.0.
+This project was created to test an issue I experienced when creating a command buffer in Vulkano for bit blitting.
+The code found in master, which is copied from https://github.com/matthew-russo/vulkan-tutorial-rs/blob/29_multisampling/src/bin/28_generating_mipmaps.rs and uses Vulkano 0.11.1, functions correctly on my system. The branch 'version_0-19-0' uses the latet versions of all dependencies, including Vulkano 0.19.0, and panics on a BlitImageError. The same behavior also occurs on version 0.18.0.
 ## My Specs
 * OS: Manjaro Linux (Kernel version: 5.6.15-1-MANJARO)
 * GPU: AMD Radeon RX580 
