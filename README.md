@@ -1,14 +1,13 @@
 # vulkan-tutorial-test
 This project was created to test an issue I experienced with creating a command buffer for bit blitting.
 The code found in master is copied from https://github.com/matthew-russo/vulkan-tutorial-rs/blob/29_multisampling/src/bin/28_generating_mipmaps.rs and functions correctly on my system, and uses Vulkano 0.11.1. The branch`version_0-19-0`uses the latet versions of all dependencies, including Vulkano 0.19.0, and panics on a BlitImageError. The same behavior also occurs on version 0.18.0.
-
 ## My Specs
 * OS: Manjaro Linux (Kernel version: 5.6.15-1-MANJARO)
 * GPU: AMD Radeon RX580 
 * GPU Driver: VGA compatible controller: Advanced Micro Devices, Inc. [AMD/ATI] Ellesmere [Radeon RX 470/480/570/570X/580/580X/590] (rev e7) (prog-if 00 [VGA controller]), kernel drivers and modules: amdgpu)
-
 ## Stacktrace
-```thread 'main' panicked at 'called `Result::unwrap()` on an `Err` value: SyncCommandBufferBuilderError(Conflict { command1_name: "vkCmdBlitImage", command1_param: "source", command1_offset: 1, command2_name: "vkCmdBlitImage", command2_param: "destination", command2_offset: 1 })', src/main.rs:667:13
+```
+thread 'main' panicked at 'called `Result::unwrap()` on an `Err` value: SyncCommandBufferBuilderError(Conflict { command1_name: "vkCmdBlitImage", command1_param: "source", command1_offset: 1, command2_name: "vkCmdBlitImage", command2_param: "destination", command2_offset: 1 })', src/main.rs:667:13
 stack backtrace:
    0: backtrace::backtrace::libunwind::trace
              at /cargo/registry/src/github.com-1ecc6299db9ec823/backtrace-0.3.44/src/backtrace/libunwind.rs:86
