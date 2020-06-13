@@ -6,11 +6,15 @@ extern crate image;
 extern crate tobj;
 extern crate cgmath;
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use std::collections::HashSet;
-use std::time::Instant;
+use std::thread;
+use std::time::{Instant, Duration};
 
-use winit::{EventsLoop, WindowBuilder, Window, dpi::LogicalSize, Event, WindowEvent};
+use winit::window::{WindowBuilder, Window};
+use winit::dpi::LogicalSize;
+use winit::event::{Event, WindowEvent};
+use winit::event_loop::{EventLoop, ControlFlow};
 use vulkano_win::VkSurfaceBuild;
 
 use vulkano::instance::{
@@ -21,7 +25,7 @@ use vulkano::instance::{
     layers_list,
     PhysicalDevice,
 };
-use vulkano::instance::debug::{DebugCallback, MessageTypes};
+use vulkano::instance::debug::{DebugCallback, MessageType, MessageSeverity};
 use vulkano::device::{Device, DeviceExtensions, Queue, Features};
 use vulkano::swapchain::{
     Surface,
@@ -29,6 +33,7 @@ use vulkano::swapchain::{
     ColorSpace,
     SupportedPresentModes,
     PresentMode,
+    FullscreenExclusive,
     Swapchain,
     CompositeAlpha,
     acquire_next_image,
@@ -76,7 +81,17 @@ use vulkano::buffer::{
     TypedBufferAccess,
     CpuAccessibleBuffer
 };
+use vulkano::descriptor::descriptor::{
+    DescriptorDesc,
+    DescriptorDescTy,
+    DescriptorBufferDesc,
+    DescriptorImageDesc,
+    DescriptorImageDescDimensions,
+    DescriptorImageDescArray,
+    ShaderStages,
+};
 use vulkano::descriptor::descriptor_set::{
+    UnsafeDescriptorSetLayout,
     FixedSizeDescriptorSetsPool,
     FixedSizeDescriptorSet,
     PersistentDescriptorSetBuf,
@@ -100,8 +115,10 @@ use cgmath::{
     Point3
 };
 
-const WIDTH: u32 = 800;
-const HEIGHT: u32 = 600;
+const WIDTH:        u32 = 800;
+const HEIGHT:       u32 = 600;
+const FRAMERATE:    u32 = 60;
+const FRAME_PERIOD: Duration = Duration::from_millis((1.0/FRAMERATE as f32 * 1000.0) as u64);
 
 const VALIDATION_LAYERS: &[&str] =  &[
     "VK_LAYER_LUNARG_standard_validation"
@@ -137,7 +154,7 @@ impl QueueFamilyIndices {
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Default)]
 struct Vertex {
     pos: [f32; 3],
     color: [f32; 3],
@@ -158,16 +175,56 @@ struct UniformBufferObject {
     proj: Matrix4<f32>,
 }
 
-type DescriptorSetUBO = PersistentDescriptorSetBuf<Arc<CpuAccessibleBuffer<UniformBufferObject>>>;
-type DescriptorSetImage = PersistentDescriptorSetImg<Arc<ImmutableImage<Format>>>;
+type DescriptorSetUBO       = PersistentDescriptorSetBuf<Arc<CpuAccessibleBuffer<UniformBufferObject>>>;
+type DescriptorSetImage     = PersistentDescriptorSetImg<Arc<ImmutableImage<Format>>>;
 type DescriptorSetResources = ((((), DescriptorSetUBO), DescriptorSetImage), PersistentDescriptorSetSampler);
+type DescriptorSet          = Arc<FixedSizeDescriptorSet<DescriptorSetResources>>;
 
-struct HelloTriangleApplication {
+struct Display {
+    event_loop: EventLoop<()>,
+}
+
+impl Display {
+    pub fn new() -> Self {
+        Self { event_loop: EventLoop::new() }
+    }
+
+    pub fn run(self, should_exit: Arc<RwLock<bool>>) {
+        self.event_loop.run(move |event, _target, control_flow| {
+            let mut exit: Option<bool> = None;
+
+            // Handle events
+            match event {
+                Event::WindowEvent { event, .. } => {
+                    match event {
+                        WindowEvent::CloseRequested => {
+                            if let Ok(mut guard) = should_exit.try_write() { *guard = true; }
+                            exit = Some(true);
+                        },
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+
+            // Read the guard if it has not been locked on already
+            if let None = exit {
+                exit = Some(match should_exit.read() {
+                    Ok(guard) => *guard,
+                    Err(_) => true // Another thread is either locked on write or is
+                });                // in an error state; assume true in those cases
+            }
+
+            *control_flow = if let Some(true) = exit { ControlFlow::Exit } else { ControlFlow::Poll };
+        });
+    }
+}
+
+#[allow(unused)]
+struct Renderer {
     instance: Arc<Instance>,
-    #[allow(unused)]
     debug_callback: Option<DebugCallback>,
 
-    events_loop: EventsLoop,
     surface: Arc<Surface<Window>>,
 
     physical_device_index: usize, // can't store PhysicalDevice directly (lifetime issues)
@@ -179,39 +236,37 @@ struct HelloTriangleApplication {
     swap_chain: Arc<Swapchain<Window>>,
     swap_chain_images: Vec<Arc<SwapchainImage<Window>>>,
 
-    render_pass: Arc<RenderPassAbstract + Send + Sync>,
-    graphics_pipeline: Arc<GraphicsPipelineAbstract + Send + Sync>,
+    render_pass: Arc<dyn RenderPassAbstract + Send + Sync>,
+    graphics_pipeline: Arc<dyn GraphicsPipelineAbstract + Send + Sync>,
 
-    swap_chain_framebuffers: Vec<Arc<FramebufferAbstract + Send + Sync>>,
+    swap_chain_framebuffers: Vec<Arc<dyn FramebufferAbstract + Send + Sync>>,
 
-    vertex_buffer: Arc<BufferAccess + Send + Sync>,
-    index_buffer: Arc<TypedBufferAccess<Content=[u32]> + Send + Sync>,
+    vertex_buffer: Arc<dyn BufferAccess + Send + Sync>,
+    index_buffer: Arc<dyn TypedBufferAccess<Content=[u32]> + Send + Sync>,
     uniform_buffers: Vec<Arc<CpuAccessibleBuffer<UniformBufferObject>>>,
 
-    descriptor_sets: Vec<Arc<FixedSizeDescriptorSet<Arc<GraphicsPipelineAbstract + Send + Sync>, DescriptorSetResources>>>,
+    descriptor_sets: Vec<DescriptorSet>,
 
     command_buffers: Vec<Arc<AutoCommandBuffer>>,
 
     depth_format: Format,
 
-    previous_frame_end: Option<Box<GpuFuture>>,
     recreate_swap_chain: bool,
-
     start_time: Instant,
 }
 
-impl HelloTriangleApplication {
-    pub fn initialize() -> Self {
+impl Renderer {
+    pub fn initialize(display: &Display) -> Self {
         let instance = Self::create_instance();
         let debug_callback = Self::setup_debug_callback(&instance);
-        let (events_loop, surface) = Self::create_surface(&instance);
+        let surface = Self::create_surface(&instance, &display.event_loop);
 
         let physical_device_index = Self::pick_physical_device(&instance, &surface);
         let (device, graphics_queue, present_queue) = Self::create_logical_device(
             &instance, &surface, physical_device_index);
 
         let (swap_chain, swap_chain_images) = Self::create_swap_chain(&instance, &surface, physical_device_index,
-            &device, &graphics_queue, &present_queue, None);
+            &device, &graphics_queue, &present_queue);
 
         let depth_format = Self::find_depth_format();
         let depth_image = Self::create_depth_image(&device, swap_chain.dimensions(), depth_format);
@@ -233,16 +288,12 @@ impl HelloTriangleApplication {
         let index_buffer = Self::create_index_buffer(&graphics_queue, indices);
         let uniform_buffers = Self::create_uniform_buffers(&device, swap_chain_images.len(), start_time, swap_chain.dimensions());
 
-        let descriptor_sets_pool = Self::create_descriptor_pool(&graphics_pipeline);
-        let descriptor_sets = Self::create_descriptor_sets(&descriptor_sets_pool, &uniform_buffers, &texture_image, &image_sampler);
-
-        let previous_frame_end = Some(Self::create_sync_objects(&device));
+        let descriptor_sets = Self::create_descriptor_sets(&device, &uniform_buffers, &texture_image, &image_sampler);
 
         let mut app = Self {
             instance,
             debug_callback,
-
-            events_loop,
+            
             surface,
 
             physical_device_index,
@@ -269,9 +320,7 @@ impl HelloTriangleApplication {
 
             depth_format,
 
-            previous_frame_end,
             recreate_swap_chain: false,
-
             start_time
         };
 
@@ -314,27 +363,21 @@ impl HelloTriangleApplication {
 
     fn get_required_extensions() -> InstanceExtensions {
         let mut extensions = vulkano_win::required_extensions();
-        if ENABLE_VALIDATION_LAYERS {
-            // TODO!: this should be ext_debug_utils (_report is deprecated), but that doesn't exist yet in vulkano
-            extensions.ext_debug_report = true;
-        }
-
+        if ENABLE_VALIDATION_LAYERS { extensions.ext_debug_utils = true; }
         extensions
     }
 
     fn setup_debug_callback(instance: &Arc<Instance>) -> Option<DebugCallback> {
-        if !ENABLE_VALIDATION_LAYERS  {
-            return None;
-        }
+        if !ENABLE_VALIDATION_LAYERS  { return None; }
 
-        let msg_types = MessageTypes {
+        let msg_types = MessageType::all();
+        let severity = MessageSeverity {
             error: true,
             warning: true,
-            performance_warning: true,
-            information: false,
-            debug: true,
+            information: true,
+            verbose: false,
         };
-        DebugCallback::new(&instance, msg_types, |msg| {
+        DebugCallback::new(&instance, severity, msg_types, |msg| {
             println!("validation layer: {:?}", msg.description);
         }).ok()
     }
@@ -378,13 +421,9 @@ impl HelloTriangleApplication {
     }
 
     fn choose_swap_present_mode(available_present_modes: SupportedPresentModes) -> PresentMode {
-        if available_present_modes.mailbox {
-            PresentMode::Mailbox
-        } else if available_present_modes.immediate {
-            PresentMode::Immediate
-        } else {
-            PresentMode::Fifo
-        }
+        if available_present_modes.mailbox { PresentMode::Mailbox }
+        else if available_present_modes.immediate { PresentMode::Immediate }
+        else { PresentMode::Fifo }
     }
 
     fn choose_swap_extent(capabilities: &Capabilities) -> [u32; 2] {
@@ -407,7 +446,6 @@ impl HelloTriangleApplication {
         device: &Arc<Device>,
         graphics_queue: &Arc<Queue>,
         present_queue: &Arc<Queue>,
-        old_swapchain: Option<Arc<Swapchain<Window>>>,
     ) -> (Arc<Swapchain<Window>>, Vec<Arc<SwapchainImage<Window>>>) {
         let physical_device = PhysicalDevice::from_index(&instance, physical_device_index).unwrap();
         let capabilities = surface.capabilities(physical_device)
@@ -447,8 +485,9 @@ impl HelloTriangleApplication {
             capabilities.current_transform,
             CompositeAlpha::Opaque,
             present_mode,
+            FullscreenExclusive::Default, // When exclusive fullscreen is off, the app bebhaves like a borderless window
             true, // clipped
-            old_swapchain.as_ref()
+            surface_format.1
         ).expect("failed to create swap chain!");
 
         (swap_chain, images)
@@ -469,7 +508,7 @@ impl HelloTriangleApplication {
         ).unwrap()
     }
 
-    fn create_render_pass(device: &Arc<Device>, color_format: Format, depth_format: Format) -> Arc<RenderPassAbstract + Send + Sync> {
+    fn create_render_pass(device: &Arc<Device>, color_format: Format, depth_format: Format) -> Arc<dyn RenderPassAbstract + Send + Sync> {
         Arc::new(single_pass_renderpass!(device.clone(),
             attachments: {
                 color: {
@@ -497,8 +536,8 @@ impl HelloTriangleApplication {
     fn create_graphics_pipeline(
         device: &Arc<Device>,
         swap_chain_extent: [u32; 2],
-        render_pass: &Arc<RenderPassAbstract + Send + Sync>,
-    ) -> Arc<GraphicsPipelineAbstract + Send + Sync> {
+        render_pass: &Arc<dyn RenderPassAbstract + Send + Sync>,
+    ) -> Arc<dyn GraphicsPipelineAbstract + Send + Sync> {
         mod vertex_shader {
             vulkano_shaders::shader! {
                ty: "vertex",
@@ -549,12 +588,12 @@ impl HelloTriangleApplication {
 
     fn create_framebuffers(
         swap_chain_images: &[Arc<SwapchainImage<Window>>],
-        render_pass: &Arc<RenderPassAbstract + Send + Sync>,
+        render_pass: &Arc<dyn RenderPassAbstract + Send + Sync>,
         depth_image: &Arc<AttachmentImage<Format>>
-    ) -> Vec<Arc<FramebufferAbstract + Send + Sync>> {
+    ) -> Vec<Arc<dyn FramebufferAbstract + Send + Sync>> {
         swap_chain_images.iter()
             .map(|image| {
-                let fba: Arc<FramebufferAbstract + Send + Sync> = Arc::new(Framebuffer::start(render_pass.clone())
+                let fba: Arc<dyn FramebufferAbstract + Send + Sync> = Arc::new(Framebuffer::start(render_pass.clone())
                     .add(image.clone()) .unwrap()
                     .add(depth_image.clone()).unwrap()
                     .build().unwrap());
@@ -601,6 +640,7 @@ impl HelloTriangleApplication {
         let source = CpuAccessibleBuffer::from_iter(
             queue.device().clone(),
             BufferUsage { transfer_source: true, ..BufferUsage::none() },
+            false, // Argument not in old version
             image_rgba.into_raw().iter().cloned()
         ).unwrap();
 
@@ -608,7 +648,7 @@ impl HelloTriangleApplication {
             queue.device().clone(), queue.family()
         ).expect("Failed to start command buffer fro image creation!");
 
-        cb = cb.copy_buffer_to_image_dimensions(
+        cb.copy_buffer_to_image_dimensions(
             source,
             image_init,
             [0, 0, 0],
@@ -624,7 +664,7 @@ impl HelloTriangleApplication {
             let source_dim = Self::get_mip_dim(mip_idx - 1, img_dimensions).unwrap();
             let dest_dim = Self::get_mip_dim(mip_idx, img_dimensions).unwrap();
 
-            cb = cb.blit_image(
+            cb.blit_image(
                 image.clone(),
                 [0; 3],
                 source_dim,
@@ -679,7 +719,7 @@ impl HelloTriangleApplication {
         let mut vertices = Vec::new();
         let mut indices = Vec::new();
 
-        let (models, _materials) = load_obj(MODEL_PATH.as_ref()).unwrap();
+        let (models, _materials) = load_obj(MODEL_PATH, true).unwrap();
 
         for model in models.iter() {
             let mesh = &model.mesh;
@@ -709,7 +749,7 @@ impl HelloTriangleApplication {
         (vertices, indices)
     }
 
-    fn create_vertex_buffer(graphics_queue: &Arc<Queue>, vertices: Vec<Vertex>) -> Arc<BufferAccess + Send + Sync> {
+    fn create_vertex_buffer(graphics_queue: &Arc<Queue>, vertices: Vec<Vertex>) -> Arc<dyn BufferAccess + Send + Sync> {
         let (buffer, future) = ImmutableBuffer::from_iter(
             vertices.into_iter(), BufferUsage::vertex_buffer(),
             graphics_queue.clone())
@@ -718,7 +758,7 @@ impl HelloTriangleApplication {
         buffer
     }
 
-    fn create_index_buffer(graphics_queue: &Arc<Queue>, indices: Vec<u32>) -> Arc<TypedBufferAccess<Content=[u32]> + Send + Sync> {
+    fn create_index_buffer(graphics_queue: &Arc<Queue>, indices: Vec<u32>) -> Arc<dyn TypedBufferAccess<Content=[u32]> + Send + Sync> {
         let (buffer, future) = ImmutableBuffer::from_iter(
             indices.into_iter(), BufferUsage::index_buffer(),
             graphics_queue.clone())
@@ -743,6 +783,7 @@ impl HelloTriangleApplication {
             let buffer = CpuAccessibleBuffer::from_data(
                 device.clone(),
                 BufferUsage::uniform_buffer_transfer_destination(),
+                false, // Parameter not in old version of tutorial
                 uniform_buffer,
             ).unwrap();
 
@@ -752,39 +793,47 @@ impl HelloTriangleApplication {
         buffers
     }
 
-    fn create_descriptor_pool(graphics_pipeline: &Arc<GraphicsPipelineAbstract + Send + Sync>)
-        -> Arc<Mutex<FixedSizeDescriptorSetsPool<Arc<GraphicsPipelineAbstract + Send + Sync>>>>
-    {
-        Arc::new(
-            Mutex::new(
-                FixedSizeDescriptorSetsPool::new(graphics_pipeline.clone(), 0)
-            )
-        )
-    }
-
     fn create_descriptor_sets(
-        pool: &Arc<Mutex<FixedSizeDescriptorSetsPool<Arc<GraphicsPipelineAbstract + Send + Sync>>>>,
-        uniform_buffers: &[Arc<CpuAccessibleBuffer<UniformBufferObject>>],
-        texture_image: &Arc<ImmutableImage<Format>>,
-        image_sampler: &Arc<Sampler>,
-    ) -> Vec<Arc<FixedSizeDescriptorSet<Arc<GraphicsPipelineAbstract + Send + Sync>, DescriptorSetResources>>> {
-        uniform_buffers
-            .iter()
-            .map(|uniform_buffer|
-                Arc::new(
-                    pool
-                        .lock()
-                        .unwrap()
-                        .next()
-                        .add_buffer(uniform_buffer.clone())
-                        .unwrap()
-                        .add_sampled_image(texture_image.clone(), image_sampler.clone())
-                        .unwrap()
-                        .build()
-                        .unwrap()
-                )
+        device:          &Arc<Device>,
+        uniform_buffers: &Vec<Arc<CpuAccessibleBuffer<UniformBufferObject>>>,
+        texture_image:   &Arc<ImmutableImage<Format>>,
+        image_sampler:   &Arc<Sampler>,
+    ) -> Vec<DescriptorSet> {
+        let descriptor_info = vec![
+            Some(DescriptorDesc {
+                ty: DescriptorDescTy::Buffer(
+                    DescriptorBufferDesc { dynamic: Some(false), storage: false }
+                ),
+                array_count: 1,
+                stages: ShaderStages { vertex: true, .. ShaderStages::none() },
+                readonly: true,
+            }),
+            Some(DescriptorDesc {
+                ty: DescriptorDescTy::CombinedImageSampler(DescriptorImageDesc {
+                    sampled: true,
+                    dimensions: DescriptorImageDescDimensions::TwoDimensional,
+                    format: None,
+                    multisampled: false,
+                    array_layers: DescriptorImageDescArray::NonArrayed
+                }),
+                array_count: 1,
+                stages: ShaderStages { fragment: true, .. ShaderStages::none() },
+                readonly: true,
+            }),
+        ];
+
+        let layout = Arc::new(UnsafeDescriptorSetLayout::new(
+            device.clone(), descriptor_info.into_iter()).unwrap());
+        let mut pool = FixedSizeDescriptorSetsPool::new(layout);
+
+        uniform_buffers.iter().map(|uniform_buffer| {
+            Arc::new(pool.next()
+                .add_buffer(uniform_buffer.clone()).unwrap()
+                .add_sampled_image(texture_image.clone(), image_sampler.clone()).unwrap()
+                .build().unwrap()
             )
-            .collect()
+        }).collect()
+        // No need to save the pool; it's kept alive by the allocated DescriptorSets
     }
 
     fn create_command_buffers(&mut self) {
@@ -795,9 +844,12 @@ impl HelloTriangleApplication {
             .iter()
             .enumerate()
             .map(|(i, framebuffer)| {
-                Arc::new(AutoCommandBufferBuilder::primary_simultaneous_use(self.device.clone(), queue_family)
-                    .unwrap()
-                    .update_buffer(self.uniform_buffers[i].clone(), Self::update_uniform_buffer(self.start_time, dimensions))
+                let mut builder = AutoCommandBufferBuilder::primary_simultaneous_use(
+                    self.device.clone(), queue_family).unwrap();
+                builder
+                    .update_buffer(
+                        self.uniform_buffers[i].clone(),
+                        Self::update_uniform_buffer(self.start_time, dimensions))
                     .unwrap()
                     .begin_render_pass(framebuffer.clone(), false, vec![[0.0, 0.0, 0.0, 1.0].into(), ClearValue::Depth(1.0)])
                     .unwrap()
@@ -810,15 +862,13 @@ impl HelloTriangleApplication {
                         ())
                     .unwrap()
                     .end_render_pass()
-                    .unwrap()
-                    .build()
-                    .unwrap())
-            })
-            .collect();
+                    .unwrap();
+                Arc::new(builder.build().unwrap())
+            }) .collect();
     }
 
-    fn create_sync_objects(device: &Arc<Device>) -> Box<GpuFuture> {
-        Box::new(sync::now(device.clone())) as Box<GpuFuture>
+    fn create_sync_objects(device: &Arc<Device>) -> Box<dyn GpuFuture> {
+        Box::new(sync::now(device.clone())) as Box<_>
     }
 
     fn find_queue_families(surface: &Arc<Surface<Window>>, device: &PhysicalDevice) -> QueueFamilyIndices {
@@ -872,36 +922,30 @@ impl HelloTriangleApplication {
         (device, graphics_queue, present_queue)
     }
 
-    fn create_surface(instance: &Arc<Instance>) -> (EventsLoop, Arc<Surface<Window>>) {
-        let events_loop = EventsLoop::new();
-        let surface = WindowBuilder::new()
+    fn create_surface(instance: &Arc<Instance>, event_loop: &EventLoop<()>) -> Arc<Surface<Window>> {
+        WindowBuilder::new()
             .with_title("Vulkan")
-            .with_dimensions(LogicalSize::new(f64::from(WIDTH), f64::from(HEIGHT)))
-            .build_vk_surface(&events_loop, instance.clone())
-            .expect("failed to create window surface!");
-        (events_loop, surface)
+            .with_inner_size(LogicalSize::new(f64::from(WIDTH), f64::from(HEIGHT)))
+            .build_vk_surface(&event_loop, instance.clone())
+            .expect("failed to create window surface!")
     }
 
-    #[allow(unused)]
-    fn main_loop(&mut self) {
-        loop {
-            self.create_command_buffers();
-            self.draw_frame();
+    pub fn main_loop(mut self, should_exit: Arc<RwLock<bool>>) {
+        thread::Builder::new().name("Renderer".into()).spawn(move || {
+            let mut last_time = Instant::now();
+            let mut previous_frame_end = Some(Self::create_sync_objects(&self.device));
 
-            let mut done = false;
-            self.events_loop.poll_events(|ev| {
-                if let Event::WindowEvent { event: WindowEvent::CloseRequested, .. } = ev {
-                    done = true
-                }
-            });
-            if done {
-                return;
+            while !match should_exit.read() { Ok(se) => *se, Err(_) => true } {
+                while last_time.elapsed() < FRAME_PERIOD {} // Limit the framerate
+                last_time = Instant::now();
+                self.create_command_buffers();
+                self.draw_frame(&mut previous_frame_end);
             }
-        }
+        }).unwrap();
     }
 
-    fn draw_frame(&mut self) {
-        self.previous_frame_end.as_mut().unwrap().cleanup_finished();
+    fn draw_frame(&mut self, previous_frame_end: &mut Option<Box<dyn GpuFuture>>) {
+        previous_frame_end.as_mut().unwrap().cleanup_finished();
 
         if self.recreate_swap_chain {
             self.recreate_swap_chain();
@@ -909,11 +953,11 @@ impl HelloTriangleApplication {
         }
 
         let (image_index, acquire_future) = match acquire_next_image(self.swap_chain.clone(), None) {
-            Ok(r) => r,
-            Err(AcquireError::OutOfDate) => {
+            Ok((_, true, _)) | Err(AcquireError::OutOfDate) => {
                 self.recreate_swap_chain = true;
                 return;
             },
+            Ok((index, false, future)) => (index, future),
             Err(err) => panic!("{:?}", err)
         };
 
@@ -923,7 +967,7 @@ impl HelloTriangleApplication {
         // eventually it stutters, and jumps ahead to the newer frames.
         //
         // See vulkano issue 1135: https://github.com/vulkano-rs/vulkano/issues/1135
-        let future = self.previous_frame_end.take().unwrap()
+        let future = previous_frame_end.take().unwrap()
             .join(acquire_future)
             .then_execute(self.graphics_queue.clone(), command_buffer)
             .unwrap()
@@ -937,16 +981,16 @@ impl HelloTriangleApplication {
                 #[cfg(target_os = "macos")]
                 future.wait(None).unwrap();
 
-                self.previous_frame_end = Some(Box::new(future) as Box<_>);
+                *previous_frame_end = Some(Box::new(future) as Box<_>);
             }
             Err(vulkano::sync::FlushError::OutOfDate) => {
                 self.recreate_swap_chain = true;
-                self.previous_frame_end
+                *previous_frame_end
                     = Some(Box::new(vulkano::sync::now(self.device.clone())) as Box<_>);
             }
             Err(e) => {
                 println!("{:?}", e);
-                self.previous_frame_end
+                *previous_frame_end
                     = Some(Box::new(vulkano::sync::now(self.device.clone())) as Box<_>);
             }
         }
@@ -977,8 +1021,16 @@ impl HelloTriangleApplication {
     }
 
     fn recreate_swap_chain(&mut self) {
-        let (swap_chain, images) = Self::create_swap_chain(&self.instance, &self.surface, self.physical_device_index,
-            &self.device, &self.graphics_queue, &self.present_queue, Some(self.swap_chain.clone()));
+        let dimensions = self.surface.window().inner_size().into();
+
+        let (swap_chain, images) =
+            match self.swap_chain.recreate_with_dimensions(dimensions) {
+                Ok(out) => out,
+                Err(e) => {
+                    eprintln!("Swapchain not resized: {:?}", e);
+                    return;
+                }
+            };
 
         let depth_image = Self::create_depth_image(&self.device, swap_chain.dimensions(), self.depth_format);
 
@@ -994,7 +1046,26 @@ impl HelloTriangleApplication {
     }
 }
 
+struct HelloTriangleApplication {
+    display: Display,
+    renderer: Renderer,
+}
+
+impl HelloTriangleApplication {
+    fn initialize() -> Self {
+        let display = Display::new();
+        let renderer = Renderer::initialize(&display);
+        Self { display, renderer }
+    }
+
+    fn main_loop(self) {
+        let should_exit = Arc::new(RwLock::new(false));
+        self.display.run(should_exit.clone());
+        self.renderer.main_loop(should_exit.clone());
+    }
+}
+
 fn main() {
-    let mut app = HelloTriangleApplication::initialize();
+    let app = HelloTriangleApplication::initialize();
     app.main_loop();
 }
